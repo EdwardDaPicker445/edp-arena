@@ -26,6 +26,7 @@ const MIME = {'.html':'text/html; charset=utf-8', '.mp3':'audio/mpeg', '.ogg':'a
 const server = http.createServer((req, res) => {
   let p = decodeURIComponent((req.url || '/').split('?')[0]);
   if (p === '/') p = '/index.html';
+  if (p === '/health') { res.writeHead(200, {'Content-Type': 'text/plain', 'Cache-Control': 'no-store'}); return res.end('ok'); }   // for uptime pingers (keeps Render awake)
   const okPath = p === '/index.html' || p.startsWith('/sounds/');
   const file = path.normalize(path.join(ROOT, p));
   if (!okPath || !file.startsWith(ROOT + path.sep)) { res.writeHead(404); return res.end('Not found'); }
@@ -42,7 +43,7 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 class Conn {
   constructor(socket) {
     this.socket = socket; this.buf = Buffer.alloc(0); this.frag = []; this.fragLen = 0;
-    this.open = true; this.onmessage = null; this.onclose = null;
+    this.open = true; this.onmessage = null; this.onclose = null; this.lastSeen = Date.now();
     socket.on('data', d => this._data(d));
     socket.on('close', () => this._closed());
     socket.on('error', () => { try { socket.destroy(); } catch (e) {} this._closed(); });
@@ -50,6 +51,7 @@ class Conn {
   }
   _closed() { if (!this.open) return; this.open = false; this.onclose && this.onclose(); }
   _data(d) {
+    this.lastSeen = Date.now();   // any frame (incl. the browser's automatic pong) proves the client is still there
     this.buf = this.buf.length ? Buffer.concat([this.buf, d]) : d;
     for (;;) {
       const b = this.buf;
@@ -89,6 +91,7 @@ class Conn {
   }
   send(str) { this._frame(0x1, Buffer.from(str)); }
   ping() { this._frame(0x9, Buffer.alloc(0)); }
+  terminate() { try { this.socket.destroy(); } catch (e) {} this._closed(); }   // drop a dead connection right away
   close(code) {
     if (!this.open) return;
     const p = Buffer.alloc(2); p.writeUInt16BE(code || 1000, 0);
@@ -103,6 +106,7 @@ server.on('upgrade', (req, socket) => {
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
                'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  console.log('WebSocket connected from ' + (req.headers['x-forwarded-for'] || socket.remoteAddress));
   onConnection(new Conn(socket));
 });
 
@@ -164,9 +168,11 @@ function onConnection(conn) {
       const others = [...room.players.values()].map(pubInfo);
       room.players.set(me.id, me);
       if (room.hostId === null || !room.players.has(room.hostId)) room.hostId = me.id;   // first player is the room "host"
-      conn.send(JSON.stringify({t: 'welcome', id: me.id, name: me.name, color: me.color, room: room.name,
+      const welcome = JSON.stringify({t: 'welcome', id: me.id, name: me.name, color: me.color, room: room.name,
                                 map: room.map, goal: GOAL, players: others, over: room.over,
-                                host: room.hostId === me.id}));
+                                host: room.hostId === me.id});
+      conn.send(welcome);
+      console.log(`[${room.name}] welcome sent to ${me.name}: ${(welcome.length / 1024).toFixed(0)} KB${room.map ? ' (includes the custom map)' : ''}`);
       bcast(room, {t: 'join', p: pubInfo(me)}, me);
       console.log(`[${room.name}] ${me.name} joined (${room.players.size})`);
       return;
@@ -245,7 +251,16 @@ setInterval(() => {
     if (list.length) bcast(room, {t: 'snap', p: list});
   }
 }, TICK_MS);
-setInterval(() => { for (const room of rooms.values()) for (const p of room.players.values()) p.conn.ping(); }, 15000);
+/* Keep-alive: ping every 15 s; a client that has been silent for 45 s (school Wi-Fi roaming, filter dropping the link, laptop lid shut)
+   is removed, so ghost players never keep filling the 8 slots of a room. */
+setInterval(() => {
+  const now = Date.now();
+  for (const room of [...rooms.values()])
+    for (const p of [...room.players.values()]) {
+      if (now - p.conn.lastSeen > 45000) { console.log(`[${room.name}] ${p.name} timed out`); p.conn.terminate(); }
+      else p.conn.ping();
+    }
+}, 15000);
 
 server.listen(PORT, () => {
   console.log(`EDP Arena FPS server on http://localhost:${PORT}`);
