@@ -15,10 +15,15 @@ const crypto = require('crypto');
 
 const PORT = +process.env.PORT || 3000;
 const ROOT = __dirname;
-const GOAL = 15, MAX_PLAYERS = 8, TICK_MS = 50, RESTART_MS = 10000, PROTECT_MS = 2000, MIN_DEAD_MS = 2000;
+const GOAL = 15, MAX_PLAYERS = 8, TICK_MS = 33, RESTART_MS = 10000, PROTECT_MS = 2000, MIN_DEAD_MS = 2000;
 const DMG_BODY = 25, DMG_HEAD = 60;
 const MAX_MSG = 12 * 1024 * 1024;   // custom maps are sent as one message
 const MAX_NET = 256 * 1024;         // largest relayed game packet
+const BACKLOG = 32 * 1024;          // if a client has more than this queued, skip stale position data for it
+/* Fast-changing relayed packets (positions etc). If a receiver is backlogged these are dropped instead of queued,
+   because a late position is worse than a missing one (it causes the rubber-band / teleport).
+   Adjust the names to whatever your client puts in d.t when it sends movement. */
+const VOLATILE = new Set(['pos', 'state', 'move', 'p', 's', 'snap', 'look', 'anim']);
 
 /* ---------------- static files ---------------- */
 const MIME = {'.html':'text/html; charset=utf-8', '.mp3':'audio/mpeg', '.ogg':'audio/ogg', '.wav':'audio/wav',
@@ -42,7 +47,7 @@ const server = http.createServer((req, res) => {
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 class Conn {
   constructor(socket) {
-    this.socket = socket; this.buf = Buffer.alloc(0); this.frag = []; this.fragLen = 0;
+    this.socket = socket; this.buf = Buffer.alloc(0); this.pend = []; this.pendLen = 0; this.frag = []; this.fragLen = 0;
     this.open = true; this.onmessage = null; this.onclose = null; this.lastSeen = Date.now();
     socket.on('data', d => this._data(d));
     socket.on('close', () => this._closed());
@@ -52,7 +57,12 @@ class Conn {
   _closed() { if (!this.open) return; this.open = false; this.onclose && this.onclose(); }
   _data(d) {
     this.lastSeen = Date.now();   // any frame (incl. the browser's automatic pong) proves the client is still there
-    this.buf = this.buf.length ? Buffer.concat([this.buf, d]) : d;
+    // collect chunks and only concat once enough bytes for the current frame have arrived (avoids O(n^2) copying of big messages)
+    this.pend.push(d); this.pendLen += d.length;
+    if (this.need && this.pendLen < this.need) return;
+    this.need = 0;
+    this.buf = this.pend.length > 1 || this.buf.length ? Buffer.concat([this.buf, ...this.pend]) : this.pend[0];
+    this.pend = []; this.pendLen = 0;
     for (;;) {
       const b = this.buf;
       if (b.length < 2) return;
@@ -61,7 +71,7 @@ class Conn {
       if (len === 126) { if (b.length < 4) return; len = b.readUInt16BE(2); off = 4; }
       else if (len === 127) { if (b.length < 10) return; len = Number(b.readBigUInt64BE(2)); off = 10; }
       if (len > MAX_MSG || !masked) return this.close(1009);
-      if (b.length < off + 4 + len) return;
+      if (b.length < off + 4 + len) { this.need = off + 4 + len - b.length; this.pendLen = 0; return; }
       const mask = b.subarray(off, off + 4);
       const payload = Buffer.from(b.subarray(off + 4, off + 4 + len));
       for (let i = 0; i < len; i++) payload[i] ^= mask[i & 3];
@@ -90,6 +100,7 @@ class Conn {
     try { this.socket.write(Buffer.concat([head, payload])); } catch (e) {}
   }
   send(str) { this._frame(0x1, Buffer.from(str)); }
+  get backlog() { return this.socket.writableLength || 0; }
   ping() { this._frame(0x9, Buffer.alloc(0)); }
   terminate() { try { this.socket.destroy(); } catch (e) {} this._closed(); }   // drop a dead connection right away
   close(code) {
@@ -119,7 +130,7 @@ const clean = (s, n, d) => (String(s == null ? '' : s).replace(/[^\w .\-]/g, '')
 
 function getRoom(name) {
   let r = rooms.get(name);
-  if (!r) { r = {name, players: new Map(), map: null, over: false, timer: null, hostId: null}; rooms.set(name, r); }
+  if (!r) { r = {name, players: new Map(), map: null, mapJson: 'null', over: false, timer: null, hostId: null}; rooms.set(name, r); }
   return r;
 }
 function bcast(room, obj, except) {
@@ -157,7 +168,7 @@ function onConnection(conn) {
       const rname = clean(m.room, 20, 'lobby').toLowerCase();
       room = getRoom(rname);
       if (room.players.size >= MAX_PLAYERS) { conn.send(JSON.stringify({t: 'full'})); return conn.close(1000); }
-      if (room.players.size === 0 && m.map && Array.isArray(m.map.assets)) room.map = m.map;   // first player picks the map
+      if (room.players.size === 0 && m.map && Array.isArray(m.map.assets)) { room.map = m.map; room.mapJson = JSON.stringify(m.map); }   // first player picks the map (serialized once, reused for every join)
       if (room.players.size === 0) { room.over = false; }
       me = {id: nextId++, conn, name: clean(m.name, 16, 'Player'), color: freeColor(room), tint: rgb(m.tint), tracer: rgb(m.tracer),
             x: 0, y: 0, z: 0, yaw: 0, pitch: 0, g: true, hp: 100, alive: true, kills: 0, deaths: 0,
@@ -168,9 +179,9 @@ function onConnection(conn) {
       const others = [...room.players.values()].map(pubInfo);
       room.players.set(me.id, me);
       if (room.hostId === null || !room.players.has(room.hostId)) room.hostId = me.id;   // first player is the room "host"
-      const welcome = JSON.stringify({t: 'welcome', id: me.id, name: me.name, color: me.color, room: room.name,
-                                map: room.map, goal: GOAL, players: others, over: room.over,
-                                host: room.hostId === me.id});
+      const welcome = '{"t":"welcome","id":' + me.id + ',"name":' + JSON.stringify(me.name) + ',"color":' + me.color +
+        ',"room":' + JSON.stringify(room.name) + ',"map":' + room.mapJson + ',"goal":' + GOAL +
+        ',"players":' + JSON.stringify(others) + ',"over":' + room.over + ',"host":' + (room.hostId === me.id) + '}';
       conn.send(welcome);
       console.log(`[${room.name}] welcome sent to ${me.name}: ${(welcome.length / 1024).toFixed(0)} KB${room.map ? ' (includes the custom map)' : ''}`);
       bcast(room, {t: 'join', p: pubInfo(me)}, me);
@@ -186,7 +197,12 @@ function onConnection(conn) {
         const v = room.players.get(Number(m.to));
         if (v && v !== me && v.conn.open) v.conn.send(out);
       } else {
-        for (const p of room.players.values()) if (p !== me && p.conn.open) p.conn.send(out);
+        const vol = VOLATILE.has(m.d.t) || VOLATILE.has(m.d.type);
+        for (const p of room.players.values()) {
+          if (p === me || !p.conn.open) continue;
+          if (vol && p.conn.backlog > BACKLOG) continue;
+          p.conn.send(out);
+        }
       }
       return;
     }
@@ -248,7 +264,10 @@ setInterval(() => {
     if (room.players.size < 2) continue;
     const list = [];
     for (const p of room.players.values()) if (p.alive && p.hasPos) list.push([p.id, +p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2), +p.yaw.toFixed(3), +p.pitch.toFixed(3), p.g ? 1 : 0]);
-    if (list.length) bcast(room, {t: 'snap', p: list});
+    if (list.length) {
+      const out = JSON.stringify({t: 'snap', ts: Date.now(), p: list});   // ts lets the client interpolate on server time
+      for (const p of room.players.values()) if (p.conn.open && p.conn.backlog <= BACKLOG) p.conn.send(out);   // never queue stale snaps
+    }
   }
 }, TICK_MS);
 /* Keep-alive: ping every 15 s; a client that has been silent for 45 s (school Wi-Fi roaming, filter dropping the link, laptop lid shut)
