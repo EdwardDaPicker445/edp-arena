@@ -1,7 +1,6 @@
 /*
  * EDP Arena FPS - multiplayer server (no npm packages needed, Node 16+).
  *
- *   node server.js            -> http://localhost:3000   (PORT=8080 node server.js to change)
  *
  * Serves index.html and /sounds/ from this folder, and a WebSocket endpoint at /ws.
  * The server owns HP, kills, deaths, respawns and the match score; clients send their
